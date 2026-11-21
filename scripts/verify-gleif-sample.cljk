@@ -2,9 +2,10 @@
 ;; scripts/verify-gleif-sample.cljk
 ;;
 ;; Recompute the GLEIF sample snapshot from its recorded request parameters and
-;; fail when a row lacks provenance, when the row count differs, or when the D4
-;; decision record is missing. Reads files only; performs no network fetch and
-;; no screening.
+;; fail when a row lacks provenance, when the row count is inconsistent, when
+;; the D4 decision record is missing, when a row's entity category is not in
+;; the non-person allowlist, or when a legal name carries a sole-proprietor
+;; marker. Reads files only; performs no network fetch and no screening.
 ;;
 ;; Run (from the repository root):
 ;;   nbb scripts/verify-gleif-sample.cljk [samples/gleif-sample-*.edn]
@@ -46,6 +47,33 @@
 (defn required-prov-keys []
   [:publisher :retrieved-at :page :license])
 
+;; Entity categories GLEIF defines for non-person entities. SOLE_PROPRIETOR,
+;; empty values, and anything not on this list fail. A genuinely new GLEIF
+;; category fails loudly here so a person can review it before it is allowed.
+(def allowed-categories
+  #{"GENERAL" "BRANCH" "FUND"
+    "INTERNATIONAL_ORGANIZATION" "RESIDENT_GOVERNMENT_ENTITY"})
+
+;; Sole-proprietor imprints in legal names (simple heuristic, Decision AWAI-3823
+;; follow-up). EURL is the French single-member-company marker, analogous to
+;; the named EIRL. A match lists the row and fails; review decides.
+(def sole-prop-markers
+  [#"(?i)e\.\s*k\.?"
+   #"(?i)\beirl\b"
+   #"(?i)\beurl\b"
+   #"(?i)einzelunternehm"
+   #"(?i)einzelfirma|einzelkauf"
+   #"個人事業"
+   #"(?i)sole\s+proprietor|sole\s+trader"
+   #"(?i)eenmanszaak"
+   #"(?i)ditta\s+individuale"
+   #"(?i)empresari[oa]\s+individual|empresa\s+individual"
+   #"(?i)auto\s*-?\s*entrepreneur"])
+
+(defn marker-hit [legal-name]
+  (when (string? legal-name)
+    (some (fn [rx] (when (re-find rx legal-name) (str rx))) sole-prop-markers)))
+
 (let [arg (first *command-line-args*)
       sample-path (if (and arg (not (str/starts-with? arg "--"))) arg (default-sample))]
   (cond
@@ -77,10 +105,13 @@
              (pr-str (select-keys (assoc doc :d4 (if (map? d4) (select-keys d4 [:allows-fetch]) d4))
                                   [:issue :d4]))))
 
-    ;; ── row count recomputed from the recorded target ──
-    (if (= target (count rows))
-      (pass! :row-count target (count rows))
-      (fail! :row-count target (count rows)))
+    ;; ── row count: internally consistent and at most the recorded target ──
+    ;; (post-fetch exclusions may leave fewer rows than the target; refetching
+    ;; is prohibited, so count == target is NOT required)
+    (if (and (= (:rows doc) (count rows)) (<= (count rows) target) (pos? (count rows)))
+      (pass! :row-count-consistent (str "<= target " target) (count rows))
+      (fail! :row-count-consistent (str "<= target " target " and :rows == count")
+             {:rows-field (:rows doc) :actual (count rows) :target target}))
 
     ;; ── every row carries complete provenance ──
     (let [bad (vec (keep-indexed
@@ -108,6 +139,29 @@
         (pass! :no-sole-proprietor 0 0)
         (fail! :no-sole-proprietor 0 sp)))
 
+    ;; ── every category is in the non-person allowlist ──
+    ;; (SOLE_PROPRIETOR, empty values, and unknown values all fail, named)
+    (let [bad (vec (keep-indexed (fn [i r]
+                                   (when-not (contains? allowed-categories (:category r))
+                                     {:index i :lei (:lei r) :category (:category r)}))
+                                 rows))]
+      (if (empty? bad)
+        (pass! :category-allowlisted (str (count rows) " rows") (str (count rows) " rows"))
+        (fail! :category-allowlisted (str "all of " (count rows) " rows in allowlist") bad)))
+
+    ;; ── no legal name carries a sole-proprietor marker ──
+    ;; (lists every hit; review decides, the sample drops them)
+    (let [hits (vec (keep-indexed (fn [i r]
+                                    (when-let [m (marker-hit (:legal-name r))]
+                                      {:index i :lei (:lei r)
+                                       :legal-name (:legal-name r)
+                                       :category (:category r)
+                                       :marker m}))
+                                  rows))]
+      (if (empty? hits)
+        (pass! :no-sole-prop-name 0 0)
+        (fail! :no-sole-prop-name 0 hits)))
+
     ;; ── required entity fields present ──
     (let [bad (vec (keep-indexed
                     (fn [i r]
@@ -123,13 +177,16 @@
         (fail! :entity-fields-complete (str (count rows) " rows") bad)))
 
     ;; ── fetched/excluded arithmetic recomputed ──
-    (let [exc (get-in doc [:excluded "SOLE_PROPRIETOR"])
+    ;; (:excluded sums every exclusion reason: fetch-time and post-fetch)
+    (let [exc-map (:excluded doc)
+          exc-total (reduce + 0 (vals (or exc-map {})))
           skip (:skipped-incomplete doc)
           fetched (:fetched doc)
-          expect (+ (count rows) (or exc 0) (or skip 0))]
-      (if (and (nat-int? exc) (nat-int? skip) (= fetched expect))
+          expect (+ (count rows) exc-total (or skip 0))]
+      (if (and (map? exc-map) (every? nat-int? (vals exc-map))
+               (nat-int? skip) (= fetched expect))
         (pass! :fetched-arithmetic fetched expect)
-        (fail! :fetched-arithmetic expect fetched)))
+        (fail! :fetched-arithmetic expect {:fetched fetched :excluded exc-map :skipped skip})))
 
     ;; ── row pages fall inside the recorded page range ──
     (let [pages (vec (:pages (:request doc)))

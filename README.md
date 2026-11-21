@@ -263,11 +263,19 @@ exit 0 = 全一致 / 1 = 食い違い / **2 = 判定できなかった**（0 と
   Commons（CC0）の下で提供され、帰属表示は法的には不要。推奨される運用は
   publisher として GLEIF を、取得日とともに名指しすること。
 - スナップショット: `samples/gleif-sample-2026-11-21.edn`、取得日 **2026-11-21**、
-  **1,000 行**。N4 により entity category が `SOLE_PROPRIETOR`
-  の行は外した（取得 1,132 行のうち 132 行を除外。個人の名前と住所が入りうるため）。
+  **998 行**（取得 1,132 行から 134 行を除外。取り直しはしない）。
+  N4 により entity category が `SOLE_PROPRIETOR` の行は外した（132 行。
+  個人の名前と住所が入りうるため）。さらに Decision の追加検査で、法人名に
+  個人事業の印（EURL。EIRL と同様のフランス一人会社形態）を持つ 2 行を外した:
+  `894500H6HXW7JUI5BS05`「EURL BLANC MICHEL」（個人の氏名＋形態）、
+  `894500HLW8SZDZI2RC72`「EURL ELEC FENOUILLEDES」（一人会社形態）。
+  検証器（`scripts/verify-gleif-sample.cljk`）が category の許可一覧
+  （GENERAL・BRANCH・FUND・INTERNATIONAL_ORGANIZATION・RESIDENT_GOVERNMENT_ENTITY）
+  と法人名の個人事業マーカー（e.K.・EIRL・EURL・Einzelunternehmen・個人事業 など）を
+  検査し、該当行があれば一覧を出して落とす。
   住所・定義文は保存していない（1 行の項目: LEI・法人名・言語・category・status・
   jurisdiction・legalForm id のみ。第三者の分類や一覧の全件・定義文は公開しない）。
-- provenance: 全 1,000 行が publisher（GLEIF）・retrieved-at・要求ページと
+- provenance: 全 998 行が publisher（GLEIF）・retrieved-at・要求ページと
   パラメータ・CC0 タグを持つ。欠けた行は検証器が落とす（100%）。
 - 照合について: **この repo の照合の機能は、法令上の制裁チェックではありません。
   一致は候補で、人が確かめる必要があります。** この issue では screenEntity を
@@ -290,6 +298,10 @@ nbb scripts/verify-gleif-sample.cljk
 
 取得実測（2026-11-21）: HTTP 6 要求・約12/min（上限 60/min の 5 分の 1）、
 `ROWS 1000`、`EXCLUDED SOLE_PROPRIETOR=132`、`PROVENANCE 1000/1000 = 100.0%`、
-exit 0。検証は全 7 項目 PASS で exit 0。負の対照は `scripts/verify-gleif-sample.cljk`
-に `/tmp` の写しで実施し、いずれも原因を名指しで FAIL（exit 1）した後に写しを捨てた:
-(a) provenance の 1 項目除去、(b) 1 行削除、(c) dry-run で上限超えを要求前に拒否。
+exit 0。その後の Decision 対応で上記 2 行を除外し、現在は 998 行
+（`EXCLUDED SOLE_PROPRIETOR=132 PERSON_LIKE_NAME_MARKER=2`、
+`PROVENANCE 998/998 = 100.0%`）。検証は全 9 項目 PASS で exit 0。
+負の対照は `/tmp` の写しで実施し、いずれも原因を名指しで FAIL（exit 1）
+した後に写しを捨てた: (a) provenance の 1 項目除去、(b) 1 行削除、
+(c) dry-run で上限超えを要求前に拒否、(d) SOLE_PROPRIETOR 行の一時挿入
+（`no-sole-proprietor` と `category-allowlisted` が該当行を名指しで FAIL）。

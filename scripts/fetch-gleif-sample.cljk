@@ -1,0 +1,275 @@
+#!/usr/bin/env nbb
+;; scripts/fetch-gleif-sample.cljk
+;;
+;; Fetch a small dated GLEIF LEI sample (default 1,000 rows) as one snapshot,
+;; excluding entity category SOLE_PROPRIETOR (N4: personal names and addresses
+;; may be present). Every kept row carries provenance (publisher, retrieved-at,
+;; request page, license tag). Nothing here uploads, registers, or pins
+;; anything; no screenEntity call exists anywhere in this repo.
+;;
+;; Precondition (AWAI-3823 D4, recorded 2026-11-22 in the issue): fetching and
+;; storing the GLEIF sample creates no AML/sanctions liability. This script
+;; performs no screening and publishes no matching results.
+;;
+;; Rate limit (verified 2026-11-21 on https://api.gleif.org/docs, which
+;; redirects to the Postman-published API reference): "Rate limiting is
+;; currently set at 60 requests, per minute, per user, for all users."
+;; The client stays far below it (default one request per 5s ~= 12 req/min)
+;; and backs off on 429 regardless (honors Retry-After, then retries the same
+;; page up to 3 times before aborting).
+;;
+;; Run (from the repository root):
+;;   nbb scripts/fetch-gleif-sample.cljk -- --out samples/gleif-sample-2026-11-21.edn
+;;   nbb scripts/fetch-gleif-sample.cljk -- --dry-run
+;;   nbb scripts/fetch-gleif-sample.cljk -- --dry-run --max-requests-per-minute 1
+;;     (refuses the plan before any request: the negative control for (c))
+;;
+;; Uses only what nbb ships: node builtins (fs, path) plus clojure.edn /
+;; clojure.string. Network goes through js/fetch.
+
+(require '[clojure.edn :as edn]
+         '[clojure.string :as str]
+         '["fs" :as fs]
+         '["path" :as path])
+
+(def endpoint "https://api.gleif.org/api/v1/lei-records")
+(def docs-url "https://api.gleif.org/docs")
+(def publisher "GLEIF")
+(def license-tag "CC0-1.0")
+(def excluded-category "SOLE_PROPRIETOR")
+(def published-rate-limit "60 requests/min/user (https://api.gleif.org/docs, read 2026-11-21)")
+
+(defn usage []
+  (println "usage: nbb scripts/fetch-gleif-sample.cljk -- [--out FILE] [--target N]")
+  (println "       [--page-size N] [--start-page N] [--min-interval-ms N]")
+  (println "       [--max-requests-per-minute N] [--dry-run]")
+  (println "Defaults: --target 1000 --page-size 200 --start-page 1")
+  (println "          --min-interval-ms 5000 --max-requests-per-minute 60"))
+
+(defn parse-args [argv]
+  (loop [xs (if (= "--" (first argv)) (vec (rest argv)) argv)
+         opts {:target 1000 :page-size 200 :start-page 1
+                       :min-interval-ms 5000 :max-requests-per-minute 60
+                       :dry-run false :out nil}]
+    (if (empty? xs)
+      opts
+      (let [[k & rst] xs]
+        (cond
+          (= k "--out") (recur (rest rst) (assoc opts :out (first rst)))
+          (= k "--target") (recur (rest rst) (assoc opts :target (js/parseInt (first rst) 10)))
+          (= k "--page-size") (recur (rest rst) (assoc opts :page-size (js/parseInt (first rst) 10)))
+          (= k "--start-page") (recur (rest rst) (assoc opts :start-page (js/parseInt (first rst) 10)))
+          (= k "--min-interval-ms") (recur (rest rst) (assoc opts :min-interval-ms (js/parseInt (first rst) 10)))
+          (= k "--max-requests-per-minute") (recur (rest rst) (assoc opts :max-requests-per-minute (js/parseInt (first rst) 10)))
+          (= k "--dry-run") (recur rst (assoc opts :dry-run true))
+          (= k "--help") (assoc opts :help true)
+          :else (recur rst opts))))))
+
+(defn sleep-ms [ms]
+  (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+
+(defn iso-now []
+  (.toISOString (js/Date.)))
+
+(defn utc-date [iso]
+  (subs iso 0 10))
+
+(defn page-url [page size]
+  (str endpoint "?page[number]=" page "&page[size]=" size))
+
+(defn get* [url]
+  (.then (js/fetch url #js {:headers #js {"Accept" "application/vnd.api+json"}})
+         (fn [res] (.then (.json res)
+                          (fn [body] {:status (.-status res)
+                                      :headers (.-headers res)
+                                      :body (js->clj body :keywordize-keys true)})))))
+
+(defn retry-after-ms [headers default-ms]
+  (try
+    (let [v (when headers (.get headers "retry-after"))]
+      (if (and v (not (str/blank? v)))
+        (* 1000 (js/parseInt v 10))
+        default-ms))
+    (catch :default _ default-ms)))
+
+(declare fetch-page)
+
+(defn fetch-error [url retries-left backoff-ms cause]
+  (if (pos? retries-left)
+    (do (println (str "RETRY\t" url " cause=" cause " backoff-ms=" backoff-ms))
+        (.then (sleep-ms backoff-ms)
+               (fn [_] (fetch-page url (dec retries-left) (* 2 backoff-ms)))))
+    (js/Promise.reject (js/Error. (str "page fetch failed after retries: " url " cause=" cause)))))
+
+(defn fetch-page [url retries-left backoff-ms]
+  (.then (get* url)
+         (fn [{:keys [status headers body]}]
+           (cond
+             (= status 200) {:ok true :body body}
+             (and (= status 429) (pos? retries-left))
+             (.then (sleep-ms (retry-after-ms headers backoff-ms))
+                    (fn [_] (fetch-page url (dec retries-left) (* 2 backoff-ms))))
+             :else {:ok false :status status}))
+         (fn [e] (fetch-error url retries-left backoff-ms (or (.-message e) (str e))))))
+
+(defn row-of [rec page size retrieved-at]
+  (let [a (:attributes rec)
+        e (:entity a)
+        ln (:legalName e)]
+    {:lei (:lei a)
+     :legal-name (:name ln)
+     :name-language (:language ln)
+     :category (:category e)
+     :status (:status e)
+     :jurisdiction (:jurisdiction e)
+     :legal-form (get-in e [:legalForm :id])
+     :provenance {:publisher publisher
+                  :retrieved-at retrieved-at
+                  :page page
+                  :page-size size
+                  :request-params (str "page[number]=" page "&page[size]=" size)
+                  :license license-tag}}))
+
+(defn row-complete? [r]
+  (and (string? (:lei r)) (= 20 (count (:lei r)))
+       (string? (:legal-name r)) (not (str/blank? (:legal-name r)))
+       (string? (:category r)) (string? (:status r)) (string? (:jurisdiction r))))
+
+(defn -main [& argv]
+  (-> (js/Promise.resolve nil)
+      (.then
+       (fn [_]
+         (let [opts (parse-args (vec argv))]
+           (when (:help opts) (usage) (js/process.exit 0))
+           (let [{:keys [target page-size start-page min-interval-ms
+                         max-requests-per-minute dry-run out]} opts]
+             (when (or (not (pos? target)) (> page-size 200) (< page-size 1))
+               (println (str "FAIL\tbad plan: target=" target " page-size=" page-size
+                             " (page-size must be 1-200)"))
+               (js/process.exit 1))
+             ;; Worst case ignoring exclusions, plus headroom pages for the
+             ;; SOLE_PROPRIETOR exclusion. Dry-run refuses before any request
+             ;; when the planned pace would breach the limit.
+             (let [planned-pages (+ (long (js/Math.ceil (/ target page-size))) 2)
+                   planned-rpm (/ 60000.0 (max 1 min-interval-ms))]
+               (println (str "PLAN\tpages~" planned-pages
+                             " pace~" (.toFixed planned-rpm 1) "/min"
+                             " limit=" max-requests-per-minute "/min"))
+               (when (> planned-rpm max-requests-per-minute)
+                 (println (str "REFUSED\tdry-run would exceed the rate limit: planned "
+                               (.toFixed planned-rpm 1) "/min > allowed "
+                               max-requests-per-minute "/min; no request sent"))
+                 (js/process.exit 1))
+               (when dry-run
+                 (println "DRY-RUN\tplan accepted; 0 requests sent")
+                 (js/process.exit 0))
+               (when (nil? out)
+                 (println "FAIL\t--out FILE is required for a live fetch")
+                 (usage)
+                 (js/process.exit 1))
+               (let [retrieved-at (iso-now)]
+                 (println (str "FETCH\tsnapshot " (utc-date retrieved-at)
+                               " target=" target " excluding " excluded-category))
+                 (js/Promise.resolve
+                  {:opts opts :retrieved-at retrieved-at
+                   :page start-page :kept [] :excluded 0 :skipped 0
+                   :pages [] :requests 0 :t0 (.now js/Date)})))))))
+      (.then
+       (fn loop [st]
+         (if (or (nil? st) (>= (count (:kept st)) (get-in st [:opts :target])))
+           st
+           (let [{:keys [opts retrieved-at page kept excluded skipped pages requests t0]} st
+                 {:keys [page-size min-interval-ms target]} opts
+                 url (page-url page page-size)]
+             (-> (if (zero? requests) (js/Promise.resolve nil) (sleep-ms min-interval-ms))
+                 (.then (fn [_] (fetch-page url 3 15000)))
+                 (.then
+                  (fn [{:keys [ok status body]}]
+                    (when-not ok
+                      (println (str "FAIL\tpage " page " HTTP " status "; aborted, nothing written"))
+                      (js/process.exit 1))
+                    (let [recs (:data body)
+                          [kept2 exc2 skip2]
+                          (reduce (fn [[k e s] rec]
+                                    (let [r (row-of rec page page-size retrieved-at)]
+                                      (cond
+                                        (= (:category r) excluded-category) [k (inc e) s]
+                                        (row-complete? r) [(conj k r) e s]
+                                        :else [k e (inc s)])))
+                                  [kept excluded skipped] recs)
+                          kept3 (vec (take target kept2))]
+                      (println (str "PAGE\t" page " kept=" (count kept3)
+                                    " excluded-sp=" exc2 " skipped-incomplete=" skip2))
+                      (loop {:opts opts :retrieved-at retrieved-at
+                             :page (inc page) :kept kept3 :excluded exc2 :skipped skip2
+                             :pages (conj pages page) :requests (inc requests) :t0 t0})))))))))
+      (.then
+       (fn [st]
+         (when (nil? st) (js/process.exit 1))
+         (let [{:keys [opts retrieved-at kept excluded skipped pages requests t0]} st
+               {:keys [target page-size start-page out]} opts
+               elapsed-s (/ (- (.now js/Date) t0) 1000.0)
+               doc {:sample "gleif-lei-records"
+                    :issue "https://linear.app/kotobalabs/issue/AWAI-3823"
+                    :d4 {:recorded "2026-11-22"
+                         :allows-fetch true
+                         :decision (str "GLEIF のサンプルの取得と保存は、AML・制裁の責任を生まない。"
+                                        "この issue では screenEntity を実行せず、"
+                                        "サンプルに対する照合の結果をどこにも公開しない"
+                                        "（le-alerts の sanctions match を含む）。"
+                                        "制裁スクリーニングを機能として出すかは、"
+                                        "オーナー本人が別の issue で決める。"
+                                        "screenEntity のコードはこの issue では変えない。"
+                                        "この行が記録されたので、取得に進んでよい。")}
+                    :source {:publisher publisher
+                             :api endpoint
+                             :docs docs-url
+                             :license license-tag
+                             :license-note (str "GLEIF Open Data page: data on GLEIF's website "
+                                                "is provided under a Creative Commons (CC0) license. "
+                                                "Attribution is not legally required; recommended practice "
+                                                "names GLEIF as publisher with the retrieval date.")
+                             :rate-limit published-rate-limit}
+                    :request {:endpoint endpoint
+                               :start-page start-page
+                               :page-size page-size
+                               :pages pages
+                               :target target
+                               :exclude-category excluded-category
+                               :min-interval-ms (:min-interval-ms opts)}
+                    :retrieved-at retrieved-at
+                    :snapshot-date (utc-date retrieved-at)
+                    :rows (count kept)
+                    :fetched (+ (count kept) excluded skipped)
+                    :excluded {excluded-category excluded}
+                    :skipped-incomplete skipped
+                    :http-requests requests
+                    :rows-data kept}
+               prov-ok (count (filter (fn [r]
+                                        (let [p (:provenance r)]
+                                          (and (= publisher (:publisher p))
+                                               (string? (:retrieved-at p))
+                                               (pos-int? (:page p))
+                                               (= license-tag (:license p)))))
+                                      kept))
+               coverage (if (pos? (count kept))
+                          (* 100.0 (/ prov-ok (count kept)))
+                          0.0)]
+           (when (not= target (count kept))
+             (println (str "FAIL\tkept " (count kept) " != target " target "; nothing written"))
+             (js/process.exit 1))
+           (.writeFileSync fs out (pr-str doc) "utf8")
+           (println (str "WROTE\t" out))
+           (println (str "ROWS\t" (count kept)))
+           (println (str "SNAPSHOT\t" (:snapshot-date doc)))
+           (println (str "EXCLUDED\t" excluded-category "=" excluded
+                         " skipped-incomplete=" skipped
+                         " http-requests=" requests
+                         " elapsed-s=" (.toFixed elapsed-s 1)))
+           (println (str "PROVENANCE\t" prov-ok "/" (count kept)
+                         " = " (.toFixed coverage 1) "%"))
+           (js/process.exit 0))))
+      (.catch (fn [e] (println (str "FAIL\t" (or (.-stack e) (.-message e) (str e))))
+                    (js/process.exit 1)))))
+
+(apply -main *command-line-args*)

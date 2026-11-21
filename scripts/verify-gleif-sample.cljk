@@ -1,0 +1,207 @@
+#!/usr/bin/env nbb
+;; scripts/verify-gleif-sample.cljk
+;;
+;; Recompute the GLEIF sample snapshot from its recorded request parameters and
+;; fail when a row lacks provenance, when the row count is inconsistent, when
+;; the D4 decision record is missing, when a row's entity category is not in
+;; the non-person allowlist, or when a legal name carries a sole-proprietor
+;; marker. Reads files only; performs no network fetch and no screening.
+;;
+;; Run (from the repository root):
+;;   nbb scripts/verify-gleif-sample.cljk [samples/gleif-sample-*.edn]
+;;
+;; Exit: 0 every claim holds · 1 a claim is false · 2 could not answer.
+;;
+;; Uses only what nbb ships: node builtins (fs, path) plus clojure.edn /
+;; clojure.string.
+
+(require '[clojure.edn :as edn]
+         '[clojure.string :as str]
+         '["fs" :as fs]
+         '["path" :as path])
+
+(def root (.cwd js/process))
+(def sample-pattern (re-pattern "^gleif-sample-.*\\.edn$"))
+
+(defn default-sample []
+  (let [dir (.join path root "samples")]
+    (try
+      (let [cands (vec (filter #(re-matches sample-pattern %)
+                               (js->clj (.readdirSync fs dir))))]
+        (cond
+          (= 1 (count cands)) (.join path dir (first cands))
+          (empty? cands) ::none
+          :else ::many))
+      (catch :default _ ::unreadable))))
+
+(def failures (atom []))
+(def checks (atom 0))
+(defn fail! [label expected actual]
+  (swap! checks inc)
+  (swap! failures conj label)
+  (println (str "FAIL\t" (name label) "\texpected=" (pr-str expected) "\tactual=" (pr-str actual))))
+(defn pass! [label expected actual]
+  (swap! checks inc)
+  (println (str "PASS\t" (name label) "\texpected=" (pr-str expected) "\tactual=" (pr-str actual))))
+
+(defn required-prov-keys []
+  [:publisher :retrieved-at :page :license])
+
+;; Entity categories GLEIF defines for non-person entities. SOLE_PROPRIETOR,
+;; empty values, and anything not on this list fail. A genuinely new GLEIF
+;; category fails loudly here so a person can review it before it is allowed.
+(def allowed-categories
+  #{"GENERAL" "BRANCH" "FUND"
+    "INTERNATIONAL_ORGANIZATION" "RESIDENT_GOVERNMENT_ENTITY"})
+
+;; Sole-proprietor imprints in legal names (simple heuristic, Decision AWAI-3823
+;; follow-up). EURL is the French single-member-company marker, analogous to
+;; the named EIRL. A match lists the row and fails; review decides.
+(def sole-prop-markers
+  [#"(?i)e\.\s*k\.?"
+   #"(?i)\beirl\b"
+   #"(?i)\beurl\b"
+   #"(?i)einzelunternehm"
+   #"(?i)einzelfirma|einzelkauf"
+   #"個人事業"
+   #"(?i)sole\s+proprietor|sole\s+trader"
+   #"(?i)eenmanszaak"
+   #"(?i)ditta\s+individuale"
+   #"(?i)empresari[oa]\s+individual|empresa\s+individual"
+   #"(?i)auto\s*-?\s*entrepreneur"])
+
+(defn marker-hit [legal-name]
+  (when (string? legal-name)
+    (some (fn [rx] (when (re-find rx legal-name) (str rx))) sole-prop-markers)))
+
+(let [arg (first *command-line-args*)
+      sample-path (if (and arg (not (str/starts-with? arg "--"))) arg (default-sample))]
+  (cond
+    (= sample-path ::none)
+    (do (println "UNDETERMINED\tno samples/gleif-sample-*.edn found") (js/process.exit 2))
+
+    (= sample-path ::many)
+    (do (println "UNDETERMINED\tmore than one samples/gleif-sample-*.edn; pass one explicitly")
+        (js/process.exit 2))
+
+    (= sample-path ::unreadable)
+    (do (println "UNDETERMINED\tsamples/ unreadable") (js/process.exit 2)))
+  (let [doc (try (edn/read-string (.readFileSync fs sample-path "utf8"))
+                 (catch :default e
+                   (println (str "UNDETERMINED\tsample is not readable EDN: " (.-message e)))
+                   (js/process.exit 2)))
+        rows (vec (:rows-data doc))
+        target (:target (:request doc))
+        d4 (:d4 doc)]
+    (println (str "SAMPLE\t" sample-path))
+
+    ;; ── D4 decision record (the fetch precondition) ──
+    (if (and (map? d4)
+             (true? (:allows-fetch d4))
+             (string? (:decision d4)) (not (str/blank? (:decision d4)))
+             (string? (:issue doc)) (str/includes? (:issue doc) "AWAI-3823"))
+      (pass! :d4-decision-recorded "AWAI-3823 + allows-fetch true + non-empty decision" true)
+      (fail! :d4-decision-recorded "AWAI-3823 + allows-fetch true + non-empty decision"
+             (pr-str (select-keys (assoc doc :d4 (if (map? d4) (select-keys d4 [:allows-fetch]) d4))
+                                  [:issue :d4]))))
+
+    ;; ── row count: internally consistent and at most the recorded target ──
+    ;; (post-fetch exclusions may leave fewer rows than the target; refetching
+    ;; is prohibited, so count == target is NOT required)
+    (if (and (= (:rows doc) (count rows)) (<= (count rows) target) (pos? (count rows)))
+      (pass! :row-count-consistent (str "<= target " target) (count rows))
+      (fail! :row-count-consistent (str "<= target " target " and :rows == count")
+             {:rows-field (:rows doc) :actual (count rows) :target target}))
+
+    ;; ── every row carries complete provenance ──
+    (let [bad (vec (keep-indexed
+                    (fn [i r]
+                      (let [p (:provenance r)
+                            missing (vec (remove #(contains? p %) (required-prov-keys)))
+                            wrong (cond-> []
+                                    (not= "GLEIF" (:publisher p)) (conj :publisher)
+                                    (not (string? (:retrieved-at p))) (conj :retrieved-at)
+                                    (not (pos-int? (:page p))) (conj :page)
+                                    (not= "CC0-1.0" (:license p)) (conj :license))]
+                        (when (or (seq missing) (seq wrong) (not (map? p)))
+                          {:index i :lei (:lei r) :missing missing :wrong wrong})))
+                    rows))]
+      (if (empty? bad)
+        (pass! :provenance-complete (str (count rows) " rows, all fields") (str (count rows) " rows, all fields"))
+        (fail! :provenance-complete (str (count rows) " rows, all fields") bad)))
+
+    ;; ── N4: no SOLE_PROPRIETOR row survives ──
+    (let [sp (vec (keep-indexed (fn [i r]
+                                  (when (= "SOLE_PROPRIETOR" (:category r))
+                                    {:index i :lei (:lei r)}))
+                                rows))]
+      (if (empty? sp)
+        (pass! :no-sole-proprietor 0 0)
+        (fail! :no-sole-proprietor 0 sp)))
+
+    ;; ── every category is in the non-person allowlist ──
+    ;; (SOLE_PROPRIETOR, empty values, and unknown values all fail, named)
+    (let [bad (vec (keep-indexed (fn [i r]
+                                   (when-not (contains? allowed-categories (:category r))
+                                     {:index i :lei (:lei r) :category (:category r)}))
+                                 rows))]
+      (if (empty? bad)
+        (pass! :category-allowlisted (str (count rows) " rows") (str (count rows) " rows"))
+        (fail! :category-allowlisted (str "all of " (count rows) " rows in allowlist") bad)))
+
+    ;; ── no legal name carries a sole-proprietor marker ──
+    ;; (lists every hit; review decides, the sample drops them)
+    (let [hits (vec (keep-indexed (fn [i r]
+                                    (when-let [m (marker-hit (:legal-name r))]
+                                      {:index i :lei (:lei r)
+                                       :legal-name (:legal-name r)
+                                       :category (:category r)
+                                       :marker m}))
+                                  rows))]
+      (if (empty? hits)
+        (pass! :no-sole-prop-name 0 0)
+        (fail! :no-sole-prop-name 0 hits)))
+
+    ;; ── required entity fields present ──
+    (let [bad (vec (keep-indexed
+                    (fn [i r]
+                      (let [missing (vec (remove #(let [v (% r)]
+                                                    (and (string? v) (not (str/blank? v))))
+                                                 [:lei :legal-name :category :status :jurisdiction]))
+                            bad-lei (when (and (:lei r) (not= 20 (count (:lei r)))) (:lei r))]
+                        (when (or (seq missing) bad-lei)
+                          {:index i :lei (:lei r) :missing missing :bad-lei bad-lei})))
+                    rows))]
+      (if (empty? bad)
+        (pass! :entity-fields-complete (str (count rows) " rows") (str (count rows) " rows"))
+        (fail! :entity-fields-complete (str (count rows) " rows") bad)))
+
+    ;; ── fetched/excluded arithmetic recomputed ──
+    ;; (:excluded sums every exclusion reason: fetch-time and post-fetch)
+    (let [exc-map (:excluded doc)
+          exc-total (reduce + 0 (vals (or exc-map {})))
+          skip (:skipped-incomplete doc)
+          fetched (:fetched doc)
+          expect (+ (count rows) exc-total (or skip 0))]
+      (if (and (map? exc-map) (every? nat-int? (vals exc-map))
+               (nat-int? skip) (= fetched expect))
+        (pass! :fetched-arithmetic fetched expect)
+        (fail! :fetched-arithmetic expect {:fetched fetched :excluded exc-map :skipped skip})))
+
+    ;; ── row pages fall inside the recorded page range ──
+    (let [pages (vec (:pages (:request doc)))
+          outside (vec (map :page (remove #(contains? (set pages) (:page (:provenance %))) rows)))]
+      (if (and (seq pages) (empty? outside))
+        (pass! :pages-in-recorded-range pages (str (count rows) " rows inside"))
+        (fail! :pages-in-recorded-range pages outside)))))
+
+(println (str "CHECKED\t" @checks))
+(when (< @checks 6)
+  (println (str "UNDETERMINED\tonly " @checks " claims were evaluated; expected at least 6"))
+  (js/process.exit 2))
+(if (seq @failures)
+  (do (println (str "FAILED\t" (count @failures) " claim(s): "
+                    (str/join ", " (map name @failures))))
+      (js/process.exit 1))
+  (do (println "OK\tthe GLEIF sample recomputes from its recorded parameters")
+      (js/process.exit 0)))

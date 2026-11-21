@@ -24,7 +24,7 @@
    "src/legal_entity/worker.cljk"
    "test/legal_entity/route_test.cljk"
    "scripts/smoke-worker.cljk"
-   "scripts/verify-docs-claims.cljk"]
+   "scripts/verify-docs-claims.cljk" "blueprint.edn"]
 
   ;; 移行が撤去した 9 パス（288 行）。**名前で**残す —— byte 合計は
   ;; 「TypeScript と Svelte が消えた」を言えないが、この列挙は言える。

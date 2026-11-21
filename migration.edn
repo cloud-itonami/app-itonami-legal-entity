@@ -24,7 +24,11 @@
    "src/legal_entity/worker.cljk"
    "test/legal_entity/route_test.cljk"
    "scripts/smoke-worker.cljk"
-   "scripts/verify-docs-claims.cljk" "blueprint.edn"]
+   "scripts/verify-docs-claims.cljk" "blueprint.edn"
+   ;; AWAI-3823 の GLEIF 1,000 行サンプル（D4 記録後の取得）
+   "scripts/fetch-gleif-sample.cljk"
+   "scripts/verify-gleif-sample.cljk"
+   "samples/gleif-sample-2026-11-21.edn"]
 
   ;; 移行が撤去した 9 パス（288 行）。**名前で**残す —— byte 合計は
   ;; 「TypeScript と Svelte が消えた」を言えないが、この列挙は言える。

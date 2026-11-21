@@ -248,3 +248,48 @@ npx --yes kbb --backend sci scripts/verify-docs-claims.cljk .   # <dir> は先�
 
 exit 0 = 全一致 / 1 = 食い違い / **2 = 判定できなかった**（0 と区別する）。
 テスト・ビルド・smoke・workerd 実走は [`docs/operator-quickstart.md`](docs/operator-quickstart.md)。
+
+## 9. GLEIF サンプル（AWAI-3823、D4 取得可の記録後に取得）
+
+[AWAI-3823](https://linear.app/kotobalabs/issue/AWAI-3823) の D4（Legal、2026-11-22:
+「GLEIF のサンプルの取得と保存は、AML・制裁の責任を生まない」「この行が記録
+されたので、取得に進んでよい」）が issue に記録された後に、公開 GLEIF API から
+日付つきスナップショットを 1 件だけ取得した。フル ingest ではない。
+
+- 出典: **GLEIF**（Global Legal Entity Identifier Foundation）、
+  `https://api.gleif.org/api/v1/lei-records`。API 仕様は
+  `https://api.gleif.org/docs`（取得時 2026-11-21 確認。60 requests/min/user）。
+- ライセンス: **CC0**。GLEIF Open Data page の表示どおり、データは Creative
+  Commons（CC0）の下で提供され、帰属表示は法的には不要。推奨される運用は
+  publisher として GLEIF を、取得日とともに名指しすること。
+- スナップショット: `samples/gleif-sample-2026-11-21.edn`、取得日 **2026-11-21**、
+  **1,000 行**。N4 により entity category が `SOLE_PROPRIETOR`
+  の行は外した（取得 1,132 行のうち 132 行を除外。個人の名前と住所が入りうるため）。
+  住所・定義文は保存していない（1 行の項目: LEI・法人名・言語・category・status・
+  jurisdiction・legalForm id のみ。第三者の分類や一覧の全件・定義文は公開しない）。
+- provenance: 全 1,000 行が publisher（GLEIF）・retrieved-at・要求ページと
+  パラメータ・CC0 タグを持つ。欠けた行は検証器が落とす（100%）。
+- 照合について: **この repo の照合の機能は、法令上の制裁チェックではありません。
+  一致は候補で、人が確かめる必要があります。** この issue では screenEntity を
+  実行せず、サンプルに対する照合の結果をどこにも公開しない（`le-alerts` の
+  sanctions match を含む）。取得スクリプトも検証器も照合を呼ばない。
+  screenEntity のコードは変えていない（この repo にその実装は無い）。
+- フル ingest の計画（未実行）: 数百万行には per-record の API paging ではなく
+  GLEIF の bulk ダウンロード（concatenated / Golden Copy ファイル）だけが現実的。
+  保存先は未定。この issue では bulk ファイルを取っていない。
+- Yataverse への書き込みは無い（upload・register・pin は何もしていない）。
+- この repo で作った部分の license は権利者の決定待ち（新しい LICENSE は足さない）。
+
+```bash
+# 取得（dry-run は要求を 1 件も送らない）
+nbb scripts/fetch-gleif-sample.cljk -- --dry-run
+nbb scripts/fetch-gleif-sample.cljk -- --out samples/gleif-sample-2026-11-21.edn
+# 検証（要求パラメータからの再計算。D4 記録・行数・provenance・除外を検査）
+nbb scripts/verify-gleif-sample.cljk
+```
+
+取得実測（2026-11-21）: HTTP 6 要求・約12/min（上限 60/min の 5 分の 1）、
+`ROWS 1000`、`EXCLUDED SOLE_PROPRIETOR=132`、`PROVENANCE 1000/1000 = 100.0%`、
+exit 0。検証は全 7 項目 PASS で exit 0。負の対照は `scripts/verify-gleif-sample.cljk`
+に `/tmp` の写しで実施し、いずれも原因を名指しで FAIL（exit 1）した後に写しを捨てた:
+(a) provenance の 1 項目除去、(b) 1 行削除、(c) dry-run で上限超えを要求前に拒否。
